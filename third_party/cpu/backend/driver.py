@@ -1,24 +1,53 @@
 import os
+import platform
+import subprocess
 import hashlib
 import tempfile
 from pathlib import Path
+import re
 from triton.runtime.build import _build
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
 dirname = os.getenv("TRITON_SYS_PATH", default="/usr/local")
-llvm_root = os.getenv("LLVM_PATH", default="~/.triton/llvm")
-llvm_root = os.path.expanduser(llvm_root)
-llvm_dirs = os.listdir(llvm_root)
-if len(llvm_dirs) == 1:
-    llvm_root = os.path.join(llvm_root, llvm_dirs[0])
-include_dir = [
-    os.path.join(dirname, "include"),
-    os.path.join(llvm_root, "include"),
+# Note: need to use custom llvm build for mac arm, 
+#       the default llvm build downloaded by triton does not work
+#       need to set LLVM_CONFIG environment variable before running
+if "LLVM_CONFIG" in os.environ:
+    llvm_config = os.getenv("LLVM_CONFIG")
+    cxx_flags = subprocess.check_output([llvm_config, "--cxxflags"]).decode()
+    ld_flags = subprocess.check_output([llvm_config, "--ldflags"]).decode()
+    llvm_include_dir = list(map(lambda s: s[2:], re.findall(r'(-I\S+)', cxx_flags)))
+    llvm_library_dir = list(map(lambda s: s[2:], re.findall(r'(-L\S+)', ld_flags)))
+else:
+    llvm_root = os.getenv("LLVM_PATH", default="~/.triton/llvm")
+    llvm_root = os.path.expanduser(llvm_root)
+    llvm_dirs = os.listdir(llvm_root)
+    if len(llvm_dirs) == 1:
+        llvm_root = os.path.join(llvm_root, llvm_dirs[0])
+    llvm_include_dir = [os.path.join(llvm_root, "include")]
+    llvm_library_dir = [os.path.join(llvm_root, "lib")]
+
+include_dir = [os.path.join(dirname, "include")] + llvm_include_dir
+library_dir = [os.path.join(dirname, "lib")] + llvm_library_dir
+
+# on mac arm, we use dynamic lookup, resolve symbol at runtime. 
+# so we do not to link the llvm libraries that are already linked by triton.
+mac_dyld_libraries = [
+    "LLVMOrcJIT",
+    "LLVMExecutionEngine",
+    "LLVMRuntimeDyld",
+    "LLVMJITLink",
+    "LLVMOrcTargetProcess",
+    "LLVMOrcShared",
+    "LLVMOption",
+    "LLVMSupport",
+    "stdc++",
+    "z",
 ]
-library_dir = [os.path.join(dirname, "lib"), os.path.join(llvm_root, "lib")]
-libraries = [
+
+static_libraries = [
     "LLVMOrcJIT",
     "LLVMPasses",
     "LLVMX86CodeGen",
@@ -77,6 +106,11 @@ libraries = [
     "z",
 ]
 
+system = platform.system()
+if system == "Darwin":
+    libraries = mac_dyld_libraries
+else:
+    libraries = static_libraries
 
 def compile_module_from_src(src, name):
     key = hashlib.md5(src.encode("utf-8")).hexdigest()
