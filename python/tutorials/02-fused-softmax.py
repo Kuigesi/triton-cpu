@@ -136,6 +136,8 @@ def softmax(x):
 # This will allow us to verify that our padding mechanism works.
 
 torch.manual_seed(0)
+
+triton.runtime.driver.set_active_to_cpu()
 x = torch.randn(1823, 781, device='cpu')
 y_triton = softmax(x)
 y_torch = torch.softmax(x, axis=1)
