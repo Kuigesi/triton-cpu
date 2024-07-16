@@ -24,6 +24,8 @@ createConvertUnsupportedOps(bool promoteBf16ToFp32,
                             bool convertMixedPrecisionMatmul);
 std::unique_ptr<OperationPass<ModuleOp>> createDecomposeFpConversions();
 
+std::unique_ptr<OperationPass<ModuleOp>> createConvertDotProduct();
+
 #define GEN_PASS_REGISTRATION
 #include "cpu/include/TritonCPUTransforms/Passes.h.inc"
 
