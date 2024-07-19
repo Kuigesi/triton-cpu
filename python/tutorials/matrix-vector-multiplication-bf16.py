@@ -3,7 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_SIZE_M = 1
+BLOCK_SIZE_M = 4
 BLOCK_SIZE_N = 512
 """
 Kernel for computing Y = A @ X, where A is a dense matrix with
