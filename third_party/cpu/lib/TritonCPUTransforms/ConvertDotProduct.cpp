@@ -27,7 +27,7 @@ using namespace mlir::triton::cpu;
 
 namespace {
 
-struct ConvertMulSumToDot
+struct ConvertMulSumToDotHorizontalSum
     : public OpRewritePattern<vector::MultiDimReductionOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -116,12 +116,14 @@ struct ConvertMulSumToDot
     }
 
     SmallVector<Value> outRes(numOfOuts);
+    SmallVector<Value> mats(numOfOuts);
 
     Type outResTy = VectorType::get(resLanes, resTy.getElementType());
 
     Value zeroRes = rewriter.create<arith::ConstantOp>(loc, outResTy, rewriter.getZeroAttr(outResTy));
     for (int64_t outIdx = 0; outIdx < numOfOuts; outIdx += 1) {
         outRes[outIdx] = zeroRes;
+        mats[outIdx] = rewriter.create<vector::ExtractOp>(loc, matInput, outIdx);
     }
     
     SmallVector<Type> resultTypes = {outResTy};
@@ -131,7 +133,7 @@ struct ConvertMulSumToDot
     for (int64_t idx = 0; idx < numOfOps; idx += 1) {
         auto subVec = rewriter.create<vector::ExtractOp>(loc, vecInput, idx);
         for (int64_t outIdx = 0; outIdx < numOfOuts; outIdx += 1) {
-            auto subMat = rewriter.create<vector::ExtractOp>(loc, matInput, SmallVector<int64_t, 2>{outIdx, idx});
+            auto subMat = rewriter.create<vector::ExtractOp>(loc, mats[outIdx], idx);
             args = {outRes[outIdx], subMat, subVec};
             auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
             outRes[outIdx] = callIntrOp.getResult(0);
@@ -156,9 +158,139 @@ struct ConvertMulSumToDot
   }
 };
 
+struct ConvertMulSumToDotPack
+    : public OpRewritePattern<vector::MultiDimReductionOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::MultiDimReductionOp op,
+                                PatternRewriter &rewriter) const override {
+    MLIRContext *ctx = op.getContext();
+    Location loc = op.getLoc();
+    Value src = op.getSource();
+    Value acc = op.getAcc();
+    auto srcTy = cast<VectorType>(src.getType());
+    auto accTy = cast<VectorType>(acc.getType());
+    auto resTy = cast<VectorType>(op.getType());
+
+    auto srcRank = srcTy.getRank();
+    auto outDim = srcTy.getDimSize(0);
+    
+    if (resTy != accTy || srcRank != 2 || !isFp32(srcTy))
+      return failure();
+
+    if (op.isReducedDim(0) || !op.isReducedDim(1))
+      return failure();
+
+    if (op.getKind() != vector::CombiningKind::ADD)
+        return failure();
+
+
+    auto extFOp = src.getDefiningOp<arith::ExtFOp>();
+
+    if (!extFOp || !extFOp->hasOneUse())
+        return failure();
+    
+    auto mulFOp  = extFOp.getIn().getDefiningOp<arith::MulFOp>();
+
+    if (!mulFOp || !mulFOp->hasOneUse())
+        return failure();
+
+    Value lhs = mulFOp.getLhs();
+    Value rhs = mulFOp.getRhs();
+
+    auto lhsTy = cast<VectorType>(lhs.getType());
+    auto rhsTy = cast<VectorType>(rhs.getType());
+
+    if (!isBf16(lhsTy) || !isBf16(rhsTy))
+        return failure();
+
+    // TODO: support SVE
+    constexpr int vecLength = 128;
+
+    const int lanes = vecLength / lhsTy.getElementType().getIntOrFloatBitWidth();
+    const int resLanes = vecLength / resTy.getElementType().getIntOrFloatBitWidth();
+    int64_t kVal = lhsTy.getDimSize(1);
+
+    if (outDim % resLanes != 0)
+        return failure();
+
+    Value matVal;
+    Value vecVal;
+    auto broadCastOp = rhs.getDefiningOp<vector::BroadcastOp>();
+    matVal = lhs;
+    if (!broadCastOp) {
+        broadCastOp = lhs.getDefiningOp<vector::BroadcastOp>();
+        matVal = rhs;
+    }
+
+    if (!broadCastOp || !broadCastOp->hasOneUse())
+        return failure();
+        
+    vecVal = broadCastOp.getSource();
+
+    auto vecValTy = cast<VectorType>(vecVal.getType());
+    auto matValTy = cast<VectorType>(matVal.getType());
+
+    if (vecValTy.getDimSize(0) != 1 || matValTy.getDimSize(0) != outDim)
+        return failure();
+
+    const int numOfRegs = outDim / resLanes;
+    const int numOfOps = kVal / 2;
+
+    Type vecResTy =
+        VectorType::get({numOfRegs, resLanes}, resTy.getElementType());
+
+    Type subResTy = VectorType::get(resLanes, resTy.getElementType());
+    Type subInputTy = VectorType::get(lanes, matValTy.getElementType());
+        
+    acc = rewriter.create<vector::ShapeCastOp>(loc, vecResTy, acc);
+
+    vecVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfOps, 2}, vecValTy.getElementType()), vecVal);
+    matVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfRegs, resLanes, numOfOps, 2}, matValTy.getElementType()), matVal);
+    matVal = rewriter.create<vector::TransposeOp>(loc, matVal, SmallVector<int64_t, 4>{0, 2, 1, 3});
+    matVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfRegs, numOfOps, lanes}, matValTy.getElementType()), matVal);
+        
+        
+    Value res = rewriter.create<arith::ConstantOp>(loc, vecResTy,
+                                                 rewriter.getZeroAttr(vecResTy));
+    SmallVector<Type> resultTypes = {subResTy};
+    llvm::StringRef intrin("llvm.aarch64.neon.bfdot.v4f32.v8bf16");
+    SmallVector<Value> args;
+
+    SmallVector<Value> subRes(numOfRegs);
+    for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
+        subRes[outIdx] = rewriter.create<vector::ExtractOp>(loc, acc, outIdx);
+        //Value outMat = rewriter.create<vector::ExtractOp>(loc, matVal, outIdx);
+    }
+    for (int64_t idx = 0; idx < numOfOps; idx += 1) {
+        Value subVec = rewriter.create<vector::ExtractOp>(loc, vecVal, idx);
+        subVec = rewriter.create<vector::BroadcastOp>(loc, VectorType::get({lanes / 2, 2}, vecValTy.getElementType()), subVec);
+        subVec = rewriter.create<vector::ShapeCastOp>(loc, subInputTy, subVec);
+        for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
+            //Value subMat = rewriter.create<vector::ExtractOp>(loc, outMat, idx);
+            Value subMat = rewriter.create<vector::ExtractOp>(loc, matVal, SmallVector<int64_t, 2>{outIdx, idx});
+            args = {subRes[outIdx], subMat, subVec};
+            auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
+            subRes[outIdx] = callIntrOp.getResult(0);
+        }
+    }
+
+    for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
+        res = rewriter.create<vector::InsertOp>(loc, subRes[outIdx], res, outIdx);
+    }
+        
+    res = rewriter.create<vector::ShapeCastOp>(loc, resTy, res);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 struct ConvertDotProduct
     : public triton::cpu::impl::ConvertDotProductBase<ConvertDotProduct> {
   ConvertDotProduct() = default;
+  ConvertDotProduct(bool useHorizontalSum) {
+    this->useHorizontalSum = useHorizontalSum;
+  }
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -166,7 +298,11 @@ struct ConvertDotProduct
 
     RewritePatternSet patterns(context);
     
-    patterns.add<ConvertMulSumToDot>(context);
+    if (useHorizontalSum) {
+        patterns.add<ConvertMulSumToDotHorizontalSum>(context);
+    } else {
+        patterns.add<ConvertMulSumToDotPack>(context);
+    }
 
     if (failed(mlir::applyPatternsAndFoldGreedily(mod, std::move(patterns))))
       return signalPassFailure();
@@ -181,6 +317,10 @@ namespace cpu {
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertDotProduct() {
   return std::make_unique<ConvertDotProduct>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>> createConvertDotProduct(bool useHorizontalSum) {
+  return std::make_unique<ConvertDotProduct>(useHorizontalSum);
 }
 
 } // namespace cpu
