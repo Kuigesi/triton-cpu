@@ -53,9 +53,6 @@ struct ConvertMulSumToDot
     if (op.getKind() != vector::CombiningKind::ADD)
         return failure();
 
-    // TODO: support 2-D reduction 
-    if (outDim != 1)
-        return failure();
 
     auto extFOp = src.getDefiningOp<arith::ExtFOp>();
 
@@ -80,48 +77,77 @@ struct ConvertMulSumToDot
     constexpr int vecLength = 128;
 
     const int lanes = vecLength / lhsTy.getElementType().getIntOrFloatBitWidth();
-
+    const int resLanes = vecLength / resTy.getElementType().getIntOrFloatBitWidth();
     int64_t kVal = lhsTy.getDimSize(1);
+
+    if (outDim < 1)
+        return failure();
 
     if (kVal % lanes != 0)
         return failure();
     
+    const int numOfOuts = outDim;
     const int numOfOps = kVal / lanes;
-    
-    Type vecLhsTy =
-        VectorType::get({kVal / lanes, lanes}, lhsTy.getElementType());
 
-    lhs = rewriter.create<vector::ShapeCastOp>(loc, vecLhsTy, lhs);
+    Value matInput;
+    Value vecInput;
 
-    Type vecRhsTy =
-        VectorType::get({kVal / lanes, lanes}, rhsTy.getElementType());
-    
-    rhs = rewriter.create<vector::ShapeCastOp>(loc, vecRhsTy, rhs);
-    
-    const int resLanes = vecLength / resTy.getElementType().getIntOrFloatBitWidth();
+    if (outDim == 1) {
+        matInput = shapeCast(loc, lhs, {1, numOfOps, lanes}, rewriter);
+        vecInput = shapeCast(loc, rhs, {numOfOps, lanes}, rewriter);
+    } else {
+        vector::BroadcastOp broadCastOp;
+        if (rhs.getDefiningOp<vector::BroadcastOp>()) {
+            matInput = lhs;
+            broadCastOp = rhs.getDefiningOp<vector::BroadcastOp>();
+        } else {
+            matInput = rhs;
+            broadCastOp = lhs.getDefiningOp<vector::BroadcastOp>();
+        }
+        if (!broadCastOp || !broadCastOp->hasOneUse())
+            return failure();
+        vecInput = broadCastOp.getSource();
 
-    Type vecResTy = VectorType::get(resLanes, resTy.getElementType());
-    
-    Value subRes = rewriter.create<arith::ConstantOp>(loc, vecResTy,
-                                                 rewriter.getZeroAttr(vecResTy));
-    SmallVector<Type> resultTypes = {vecResTy};
-    llvm::StringRef intrin("llvm.aarch64.neon.bfdot.v4f32.v8bf16");
-    SmallVector<Value> args;
-    for (int64_t idx = 0; idx < numOfOps; idx += 1) {
-        auto subLhs = rewriter.create<vector::ExtractOp>(loc, lhs, idx);
-        auto subRhs = rewriter.create<vector::ExtractOp>(loc, rhs, idx);
-        args = {subRes, subLhs, subRhs};
-        auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
-        subRes = callIntrOp.getResult(0);
+        if (cast<VectorType>(vecInput.getType()).getDimSize(0) != 1 || cast<VectorType>(matInput.getType()).getDimSize(0) != outDim)
+            return failure();
+
+        matInput = shapeCast(loc, matInput, {numOfOuts, numOfOps, lanes}, rewriter);
+        vecInput = shapeCast(loc, vecInput, {numOfOps, lanes}, rewriter);
     }
 
+    SmallVector<Value> outRes(numOfOuts);
+
+    Type outResTy = VectorType::get(resLanes, resTy.getElementType());
+
+    Value zeroRes = rewriter.create<arith::ConstantOp>(loc, outResTy, rewriter.getZeroAttr(outResTy));
+    for (int64_t outIdx = 0; outIdx < numOfOuts; outIdx += 1) {
+        outRes[outIdx] = zeroRes;
+    }
+    
+    SmallVector<Type> resultTypes = {outResTy};
+    llvm::StringRef intrin("llvm.aarch64.neon.bfdot.v4f32.v8bf16");
+    SmallVector<Value> args;
+
+    for (int64_t idx = 0; idx < numOfOps; idx += 1) {
+        auto subVec = rewriter.create<vector::ExtractOp>(loc, vecInput, idx);
+        for (int64_t outIdx = 0; outIdx < numOfOuts; outIdx += 1) {
+            auto subMat = rewriter.create<vector::ExtractOp>(loc, matInput, SmallVector<int64_t, 2>{outIdx, idx});
+            args = {outRes[outIdx], subMat, subVec};
+            auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
+            outRes[outIdx] = callIntrOp.getResult(0);
+        }
+    }
+
+    Value res = rewriter.create<arith::ConstantOp>(loc, resTy, rewriter.getZeroAttr(resTy));
+    
     resultTypes = {resTy.getElementType()};
     intrin = "llvm.aarch64.neon.faddv.f32.v4f32";
-    args = {subRes};
-    auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
-    auto reducedRes = callIntrOp.getResult(0);
+    for (int64_t outIdx = 0; outIdx < numOfOuts; outIdx += 1) {
+        args = {outRes[outIdx]};
+        auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
+        res = rewriter.create<vector::InsertOp>(loc, callIntrOp.getResult(0), res, outIdx);
+    }
     
-    Value res = rewriter.create<vector::BroadcastOp>(loc, resTy, reducedRes);
     if (!isZeroConst(acc)) {
         res = rewriter.create<arith::AddFOp>(loc, res, acc);
     }
