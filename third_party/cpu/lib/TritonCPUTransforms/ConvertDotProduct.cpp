@@ -168,21 +168,27 @@ struct ConvertMulSumToDot
         SmallVector<Type> resultTypes = {subResTy};
         llvm::StringRef intrin("llvm.aarch64.neon.bfdot.v4f32.v8bf16");
         SmallVector<Value> args;
+
+        SmallVector<Value> subRes(numOfRegs);
         for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
-            Value subRes = rewriter.create<vector::ExtractOp>(loc, acc, outIdx);
+            subRes[outIdx] = rewriter.create<vector::ExtractOp>(loc, acc, outIdx);
             //Value outMat = rewriter.create<vector::ExtractOp>(loc, matVal, outIdx);
-            for (int64_t idx = 0; idx < numOfOps; idx += 1) {
+        }
+        for (int64_t idx = 0; idx < numOfOps; idx += 1) {
+            Value subVec = rewriter.create<vector::ExtractOp>(loc, vecVal, idx);
+            subVec = rewriter.create<vector::BroadcastOp>(loc, VectorType::get({lanes / 2, 2}, vecValTy.getElementType()), subVec);
+            subVec = rewriter.create<vector::ShapeCastOp>(loc, subInputTy, subVec);
+            for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
                 //Value subMat = rewriter.create<vector::ExtractOp>(loc, outMat, idx);
                 Value subMat = rewriter.create<vector::ExtractOp>(loc, matVal, SmallVector<int64_t, 2>{outIdx, idx});
-                Value subVec = rewriter.create<vector::ExtractOp>(loc, vecVal, idx);
-                subVec = rewriter.create<vector::BroadcastOp>(loc, VectorType::get({lanes / 2, 2}, vecValTy.getElementType()), subVec);
-                subVec = rewriter.create<vector::ShapeCastOp>(loc, subInputTy, subVec);
-                //subVec = rewriter.create<vector::BroadcastOp>(loc, subInputTy, subVec);
-                args = {subRes, subMat, subVec};
+                args = {subRes[outIdx], subMat, subVec};
                 auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
-                subRes = callIntrOp.getResult(0);
+                subRes[outIdx] = callIntrOp.getResult(0);
             }
-            res = rewriter.create<vector::InsertOp>(loc, subRes, res, outIdx);
+        }
+
+        for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
+            res = rewriter.create<vector::InsertOp>(loc, subRes[outIdx], res, outIdx);
         }
         
         res = rewriter.create<vector::ShapeCastOp>(loc, resTy, res);
