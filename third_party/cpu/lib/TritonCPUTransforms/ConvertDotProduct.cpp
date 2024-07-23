@@ -234,8 +234,11 @@ struct ConvertMulSumToDotPack
     if (vecValTy.getDimSize(0) != 1 || matValTy.getDimSize(0) != outDim)
         return failure();
 
+    if (kVal % lanes != 0)
+        return failure();
+    
     const int numOfRegs = outDim / resLanes;
-    const int numOfOps = kVal / 2;
+    const int numOfOps = kVal / lanes;
 
     Type vecResTy =
         VectorType::get({numOfRegs, resLanes}, resTy.getElementType());
@@ -245,10 +248,17 @@ struct ConvertMulSumToDotPack
         
     acc = rewriter.create<vector::ShapeCastOp>(loc, vecResTy, acc);
 
-    vecVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfOps, 2}, vecValTy.getElementType()), vecVal);
-    matVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfRegs, resLanes, numOfOps, 2}, matValTy.getElementType()), matVal);
-    matVal = rewriter.create<vector::TransposeOp>(loc, matVal, SmallVector<int64_t, 4>{0, 2, 1, 3});
-    matVal = rewriter.create<vector::ShapeCastOp>(loc, VectorType::get({numOfRegs, numOfOps, lanes}, matValTy.getElementType()), matVal);
+    Type inElemTy = matValTy.getElementType();
+    Type wordTy = IntegerType::get(ctx, 32);
+    
+    vecVal = shapeCast(loc, vecVal, {numOfOps, resLanes, 2}, rewriter);
+    vecVal = rewriter.create<vector::BitCastOp>(loc, VectorType::get({numOfOps, resLanes, 1}, wordTy), vecVal);
+    vecVal = shapeCast(loc, vecVal, {numOfOps, resLanes}, rewriter);
+    matVal = shapeCast(loc, matVal, {numOfRegs * resLanes, numOfOps * resLanes, 2}, rewriter);
+    matVal = rewriter.create<vector::BitCastOp>(loc, VectorType::get({numOfRegs * resLanes, numOfOps * resLanes, 1}, wordTy), matVal);
+    matVal = shapeCast(loc, matVal, {numOfRegs * resLanes, numOfOps * resLanes}, rewriter);
+    matVal = rewriter.create<vector::TransposeOp>(loc, matVal, SmallVector<int64_t, 2>{1, 0});
+    matVal = shapeCast(loc, matVal, {numOfOps, resLanes, numOfRegs, resLanes}, rewriter);
         
         
     Value res = rewriter.create<arith::ConstantOp>(loc, vecResTy,
@@ -263,6 +273,23 @@ struct ConvertMulSumToDotPack
         //Value outMat = rewriter.create<vector::ExtractOp>(loc, matVal, outIdx);
     }
     for (int64_t idx = 0; idx < numOfOps; idx += 1) {
+        Value fullVec = rewriter.create<vector::ExtractOp>(loc, vecVal, idx);
+        for (int64_t vecIdx = 0; vecIdx < resLanes; vecIdx +=1) {
+            SmallVector<int64_t> shuffleMask(resLanes, vecIdx);
+            Value subVec = rewriter.create<vector::ShuffleOp>(loc, fullVec, fullVec, shuffleMask);
+            subVec = rewriter.create<vector::BitCastOp>(loc, VectorType::get({lanes}, inElemTy), subVec);
+            for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
+                Value subMat = rewriter.create<vector::ExtractOp>(loc, matVal, SmallVector<int64_t, 2>{idx, vecIdx, outIdx});
+                subMat = rewriter.create<vector::BitCastOp>(loc, VectorType::get({lanes}, inElemTy), subMat);
+                args = {subRes[outIdx], subMat, subVec};
+                auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
+                subRes[outIdx] = callIntrOp.getResult(0);
+            }
+        }
+    }
+
+
+        /*
         Value subVec = rewriter.create<vector::ExtractOp>(loc, vecVal, idx);
         subVec = rewriter.create<vector::BroadcastOp>(loc, VectorType::get({lanes / 2, 2}, vecValTy.getElementType()), subVec);
         subVec = rewriter.create<vector::ShapeCastOp>(loc, subInputTy, subVec);
@@ -273,7 +300,7 @@ struct ConvertMulSumToDotPack
             auto callIntrOp = rewriter.create<LLVM::CallIntrinsicOp>(loc, resultTypes, intrin, args, LLVM::FastmathFlags::fast);
             subRes[outIdx] = callIntrOp.getResult(0);
         }
-    }
+        */
 
     for (int64_t outIdx = 0; outIdx < numOfRegs; outIdx += 1) {
         res = rewriter.create<vector::InsertOp>(loc, subRes[outIdx], res, outIdx);

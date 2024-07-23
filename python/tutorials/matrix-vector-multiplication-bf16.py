@@ -3,8 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
-BLOCK_SIZE_M = 1
-BLOCK_SIZE_N = 512
+BLOCK_SIZE_M = 8
+BLOCK_SIZE_N = 8
 """
 Kernel for computing Y = A @ X, where A is a dense matrix with
 M rows and N columns.
