@@ -62,6 +62,7 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
         if system == "Linux" and machine in ("aarch64", "arm64"):
             # On Arm backend, some CPU (neoverse-v2) needs to be specified through -mcpu
             cc_cmd += ["-mcpu=native"]
+    print((cc_cmd))
     ret = subprocess.check_call(cc_cmd)
     if ret == 0:
         return so
